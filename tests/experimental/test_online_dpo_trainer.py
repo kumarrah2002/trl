@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from datasets import Dataset, DatasetDict, features, load_dataset
@@ -93,6 +95,44 @@ class TestOnlineDPOTrainer(TrlTestCase):
         trainer.train()
 
         assert "train_loss" in trainer.state.log_history[-1]
+
+    def test_train_stops_on_every_eos_token_id(self):
+        # Phi-3.5 ends a turn with `<|end|>`, which only its generation config declares as eos, not its tokenizer
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Phi3ForCausalLM-3.5")
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Phi3ForCausalLM-3.5")
+        tokenizer.pad_token = tokenizer.eos_token
+
+        training_args = OnlineDPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_steps=1,
+            max_new_tokens=8,
+            logging_steps=1,
+            report_to="none",
+        )
+        trainer = OnlineDPOTrainer(
+            model=model,
+            reward_funcs=self.reward_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            reward_processing_classes=self.reward_tokenizer,
+        )
+        assert 32007 in trainer.generation_config.eos_token_id  # `<|end|>`
+
+        def fake_generate(input_ids, **kwargs):
+            # 'Blue<|end|>and green': the turn ends on `<|end|>`, and generation goes on after it
+            completion_ids = torch.tensor([[10924, 32007, 322, 7933]] * input_ids.shape[0], device=input_ids.device)
+            return torch.cat([input_ids, completion_ids], dim=-1)
+
+        with patch.object(trainer.model, "generate", side_effect=fake_generate):
+            trainer.train()
+
+        # Completions that stopped on `<|end|>` count as containing an eos token
+        log = next(entry for entry in reversed(trainer.state.log_history) if "val/contain_eos_token" in entry)
+        assert log["val/contain_eos_token"] == 1.0
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset", "none"])
     def test_init_with_eval_dataset(self, eval_dataset_type):
